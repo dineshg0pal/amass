@@ -51,56 +51,90 @@ func NamesToAddrs(db repository.Repository, since time.Time, names ...string) ([
 	}
 
 	var results []*NameAddrPair
-	// get the IPs associated with SRV, NS, and MX records
-loop:
+
 	for _, fqdn := range fqdns {
+
+		var directIPs []*network.IPAddress
+		var cnameIPs []*network.IPAddress
+		var indirectIPs []*network.IPAddress
+
 		if edges, err := db.OutgoingEdges(fqdn, since, "dns_record"); err == nil && len(edges) > 0 {
+
 			for _, edge := range edges {
+
 				switch v := edge.Relation.(type) {
+
+				//  Direct A / AAAA
 				case *oamdns.BasicDNSRelation:
 					if v.Header.RRType == 1 || v.Header.RRType == 28 {
 						if ip, err := getAddr(db, edge.ToEntity, since); err == nil {
-							results = append(results, &NameAddrPair{
-								FQDN: fqdn.Asset.(*oamdns.FQDN),
-								Addr: ip,
-							})
-							continue loop
-						}
-					} else if v.Header.RRType == 5 {
-						if ip, err := cnameQuery(db, edge.ToEntity, since); err == nil {
-							results = append(results, &NameAddrPair{
-								FQDN: fqdn.Asset.(*oamdns.FQDN),
-								Addr: ip,
-							})
-							continue loop
+							directIPs = append(directIPs, ip)
 						}
 					}
+
+					//  CNAME
+					if v.Header.RRType == 5 {
+						if ip, err := cnameQuery(db, edge.ToEntity, since); err == nil {
+							cnameIPs = append(cnameIPs, ip)
+						}
+					}
+
+				//  MX / NS
 				case *oamdns.PrefDNSRelation:
 					if v.Header.RRType == 2 || v.Header.RRType == 15 {
 						if ip, err := oneMoreName(db, edge.ToEntity, since); err == nil {
-							results = append(results, &NameAddrPair{
-								FQDN: fqdn.Asset.(*oamdns.FQDN),
-								Addr: ip,
-							})
-							continue loop
+							indirectIPs = append(indirectIPs, ip)
 						}
 					}
+
+				//  SRV
 				case *oamdns.SRVDNSRelation:
 					if v.Header.RRType == 33 {
 						if ip, err := oneMoreName(db, edge.ToEntity, since); err == nil {
-							results = append(results, &NameAddrPair{
-								FQDN: fqdn.Asset.(*oamdns.FQDN),
-								Addr: ip,
-							})
-							continue loop
+							indirectIPs = append(indirectIPs, ip)
 						}
 					}
 				}
 			}
 		}
+
+		// PRIORITY LOGIC
+
+		finalIPs := uniqueIPs(directIPs)
+
+		if len(finalIPs) == 0 {
+			finalIPs = uniqueIPs(cnameIPs)
+		}
+
+		if len(finalIPs) == 0 {
+			finalIPs = uniqueIPs(indirectIPs)
+		}
+
+		// Add ALL IPs (not just one)
+		for _, ip := range finalIPs {
+			results = append(results, &NameAddrPair{
+				FQDN: fqdn.Asset.(*oamdns.FQDN),
+				Addr: ip,
+			})
+		}
 	}
 
 	return results, nil
+}
+
+func uniqueIPs(ips []*network.IPAddress) []*network.IPAddress {
+	seen := make(map[string]bool)
+	var result []*network.IPAddress
+
+	for _, ip := range ips {
+		addr := ip.Address.String()
+		if !seen[addr] {
+			seen[addr] = true
+			result = append(result, ip)
+		}
+	}
+
+	return result
 }
 
 func getAddr(db repository.Repository, ip *dbt.Entity, since time.Time) (*network.IPAddress, error) {
